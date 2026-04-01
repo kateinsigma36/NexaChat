@@ -1,11 +1,12 @@
-const express = require('express');
+import express from 'express';
+import Chat from '../models/Chat.js';
+import User from '../models/User.js';
+import Message from '../models/Message.js';
+import auth from '../middleware/auth.js';
+import { chatValidation, createGroupValidation } from '../utils/validators.js';
+import { logger } from '../utils/helpers.js';
+
 const router = express.Router();
-const Chat = require('../models/Chat');
-const User = require('../models/User');
-const Message = require('../models/Message');
-const auth = require('../middleware/auth');
-const { chatValidation, createGroupValidation } = require('../utils/validators');
-const { logger } = require('../utils/helpers');
 
 /**
  * GET /api/chats - Получить все чаты пользователя
@@ -28,36 +29,33 @@ router.get('/', auth, async (req, res) => {
         groupName: searchRegex
       }).populate('participants', 'name avatar email isOnline lastSeen');
 
-      // Затем ищем личные чаты по участникам
-      const users = await User.find({ name: searchRegex }).select('_id');
-      const userIds = users.map(u => u._id);
+      // Ищем чаты по имени участника
+      const usersWithName = await User.find({ name: searchRegex }).select('_id');
+      const userIds = usersWithName.map(u => u._id);
       
       const chatsByParticipant = await Chat.find({
-        type: 'private',
-        participants: { $in: userIds },
-        _id: { $nin: chatsByName.map(c => c._id) }
+        ...query,
+        participants: { $in: userIds }
       }).populate('participants', 'name avatar email isOnline lastSeen');
 
-      const allChats = [...chatsByName, ...chatsByParticipant];
-      
-      // Пагинация
-      const startIndex = (page - 1) * limit;
-      const paginatedChats = allChats.slice(startIndex, startIndex + parseInt(limit));
+      // Объединяем результаты и убираем дубликаты
+      const chatIds = new Set([...chatsByName.map(c => c._id.toString()), ...chatsByParticipant.map(c => c._id.toString())]);
+      const chats = [...chatsByName, ...chatsByParticipant].filter((chat, index, self) => 
+        index === self.findIndex(c => c._id.toString() === chat._id.toString())
+      );
 
       return res.json({
         success: true,
-        count: allChats.length,
-        chats: paginatedChats
+        count: chats.length,
+        chats
       });
     }
 
-    // Без поиска - стандартная пагинация
     const chats = await Chat.find(query)
+      .populate('participants', 'name avatar email isOnline lastSeen')
       .sort({ updatedAt: -1 })
       .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .populate('participants', 'name avatar email isOnline lastSeen')
-      .populate('creator', 'name avatar');
+      .skip((page - 1) * limit);
 
     const count = await Chat.countDocuments(query);
 
@@ -65,50 +63,18 @@ router.get('/', auth, async (req, res) => {
       success: true,
       count: chats.length,
       total: count,
-      hasMore: page * limit < count,
+      page: parseInt(page),
+      pages: Math.ceil(count / limit),
       chats
     });
+
   } catch (error) {
-    logger.error(`Ошибка получения чатов: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * GET /api/chats/:id - Получить конкретный чат
- */
-router.get('/:id', auth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const chatId = req.params.id;
-
-    const chat = await Chat.findOne({
-      _id: chatId,
-      participants: userId
-    })
-      .populate('participants', 'name avatar email isOnline lastSeen status')
-      .populate('creator', 'name avatar email')
-      .populate('admins', 'name avatar email');
-
-    if (!chat) {
-      return res.status(404).json({ success: false, error: 'Чат не найден' });
-    }
-
-    // Получаем последние сообщения
-    const messages = await Message.find({ chatId })
-      .sort({ createdAt: -1 })
-      .limit(50)
-      .populate('sender', 'name avatar email')
-      .populate('replyTo');
-
-    res.json({
-      success: true,
-      chat,
-      messages: messages.reverse() // Возвращаем в хронологическом порядке
+    logger.error('Ошибка получения чатов:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при получении чатов',
+      error: error.message
     });
-  } catch (error) {
-    logger.error(`Ошибка получения чата: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -117,70 +83,123 @@ router.get('/:id', auth, async (req, res) => {
  */
 router.post('/', auth, async (req, res) => {
   try {
-    const userId = req.user._id;
-    const { type = 'private', participants, groupName, groupAvatar } = req.body;
-
-    // Валидация
-    const { error } = type === 'group' 
-      ? createGroupValidation.validate(req.body)
-      : chatValidation.validate(req.body);
-    
+    const { error } = createGroupValidation.validate(req.body);
     if (error) {
-      return res.status(400).json({ success: false, error: error.details[0].message });
+      return res.status(400).json({
+        success: false,
+        message: 'Ошибка валидации',
+        errors: error.details.map(d => d.message)
+      });
     }
+
+    const { type = 'private', participants, groupName, groupAvatar } = req.body;
+    const creatorId = req.user._id;
 
     // Проверка участников
     if (!participants || !Array.isArray(participants) || participants.length === 0) {
-      return res.status(400).json({ success: false, error: 'Необходимо указать участников' });
+      return res.status(400).json({
+        success: false,
+        message: 'Необходимо указать хотя бы одного участника'
+      });
     }
 
-    // Добавляем текущего пользователя в участники если его нет
-    const allParticipants = participants.includes(userId) 
-      ? participants 
-      : [...participants, userId];
+    // Добавляем создателя в участники если его там нет
+    if (!participants.includes(creatorId.toString())) {
+      participants.push(creatorId.toString());
+    }
 
-    // Для личного чата - проверяем, существует ли уже чат с этими участниками
-    if (type === 'private') {
-      if (allParticipants.length !== 2) {
-        return res.status(400).json({ success: false, error: 'Личный чат должен иметь ровно 2 участников' });
-      }
+    // Проверка существования пользователей
+    const users = await User.find({ _id: { $in: participants } });
+    if (users.length !== participants.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'Один или несколько пользователей не найдены'
+      });
+    }
 
+    // Для личного чата проверяем, не существует ли уже такой чат
+    if (type === 'private' && participants.length === 2) {
       const existingChat = await Chat.findOne({
         type: 'private',
-        participants: { $all: allParticipants }
+        participants: { $all: participants }
       });
 
       if (existingChat) {
-        return res.json({ success: true, chat: existingChat, created: false });
+        return res.json({
+          success: true,
+          message: 'Чат уже существует',
+          chat: existingChat
+        });
       }
     }
 
     // Создаём чат
     const chatData = {
       type,
-      participants: allParticipants,
-      creator: userId
+      participants,
+      creator: creatorId
     };
 
     if (type === 'group') {
-      chatData.groupName = groupName;
+      chatData.groupName = groupName || 'Групповой чат';
       chatData.groupAvatar = groupAvatar;
-      chatData.admins = [userId]; // Создатель становится админом
+      chatData.admins = [creatorId];
     }
 
-    const chat = await Chat.create(chatData);
-    
-    // Заполняем данные
-    const populatedChat = await Chat.findById(chat._id)
-      .populate('participants', 'name avatar email isOnline lastSeen')
-      .populate('creator', 'name avatar')
-      .populate('admins', 'name avatar');
+    const chat = new Chat(chatData);
+    await chat.save();
 
-    logger.info(`Создан чат ${chat._id} пользователем ${userId}`);
-    res.status(201).json({ success: true, chat: populatedChat, created: true });
+    // Заполняем данные об участниках
+    const populatedChat = await Chat.findById(chat._id)
+      .populate('participants', 'name avatar email isOnline lastSeen');
+
+    logger.info(`Чат создан: ${chat._id}, тип: ${type}`);
+
+    res.status(201).json({
+      success: true,
+      message: 'Чат успешно создан',
+      chat: populatedChat
+    });
+
   } catch (error) {
-    logger.error(`Ошибка создания чата: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
+    logger.error('Ошибка создания чата:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при создании чата',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/chats/:id - Получить конкретный чат
+ */
+router.get('/:id', auth, async (req, res) => {
+  try {
+    const chat = await Chat.findOne({
+      _id: req.params.id,
+      participants: req.user._id
+    }).populate('participants', 'name avatar email isOnline lastSeen');
+
+    if (!chat) {
+      return res.status(404).json({
+        success: false,
+        message: 'Чат не найден'
+      });
+    }
+
+    res.json({
+      success: true,
+      chat
+    });
+
+  } catch (error) {
+    logger.error('Ошибка получения чата:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при получении чата',
+      error: error.message
+    });
   }
 });
 
@@ -189,244 +208,49 @@ router.post('/', auth, async (req, res) => {
  */
 router.put('/:id', auth, async (req, res) => {
   try {
-    const userId = req.user._id;
-    const chatId = req.params.id;
-    const { groupName, groupAvatar, admins } = req.body;
-
     const chat = await Chat.findOne({
-      _id: chatId,
-      participants: userId
+      _id: req.params.id,
+      participants: req.user._id
     });
 
     if (!chat) {
-      return res.status(404).json({ success: false, error: 'Чат не найден' });
+      return res.status(404).json({
+        success: false,
+        message: 'Чат не найден'
+      });
     }
 
-    if (chat.type !== 'group') {
-      return res.status(400).json({ success: false, error: 'Можно обновлять только групповые чаты' });
+    // Только админы могут редактировать группу
+    if (chat.type === 'group' && !chat.admins.some(id => id.toString() === req.user._id.toString())) {
+      return res.status(403).json({
+        success: false,
+        message: 'Только администраторы могут редактировать группу'
+      });
     }
 
-    // Проверка прав администратора
-    const isAdmin = chat.admins.some(admin => admin.toString() === userId);
-    const isCreator = chat.creator.toString() === userId;
-    
-    if (!isAdmin && !isCreator) {
-      return res.status(403).json({ success: false, error: 'Нет прав на редактирование' });
-    }
+    const { groupName, groupAvatar } = req.body;
 
-    // Обновляем поля
-    if (groupName !== undefined) chat.groupName = groupName;
+    if (groupName) chat.groupName = groupName;
     if (groupAvatar !== undefined) chat.groupAvatar = groupAvatar;
-    if (admins !== undefined && Array.isArray(admins)) {
-      // Только создатель может менять админов
-      if (isCreator) {
-        chat.admins = admins;
-      }
-    }
 
-    chat.updatedAt = new Date();
     await chat.save();
-
-    const updatedChat = await Chat.findById(chat._id)
-      .populate('participants', 'name avatar email isOnline lastSeen')
-      .populate('creator', 'name avatar')
-      .populate('admins', 'name avatar');
-
-    res.json({ success: true, chat: updatedChat });
-  } catch (error) {
-    logger.error(`Ошибка обновления чата: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * POST /api/chats/:id/participants - Добавить участников в группу
- */
-router.post('/:id/participants', auth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const chatId = req.params.id;
-    const { participants } = req.body;
-
-    if (!participants || !Array.isArray(participants)) {
-      return res.status(400).json({ success: false, error: 'Некорректные данные участников' });
-    }
-
-    const chat = await Chat.findOne({
-      _id: chatId,
-      type: 'group'
-    });
-
-    if (!chat) {
-      return res.status(404).json({ success: false, error: 'Группа не найдена' });
-    }
-
-    // Проверка прав
-    const isAdmin = chat.admins.some(admin => admin.toString() === userId);
-    if (!isAdmin && chat.creator.toString() !== userId) {
-      return res.status(403).json({ success: false, error: 'Только администраторы могут добавлять участников' });
-    }
-
-    // Проверка лимита (256 участников)
-    if (chat.participants.length + participants.length > 256) {
-      return res.status(400).json({ success: false, error: 'Превышен лимит участников (256)' });
-    }
-
-    // Добавляем новых участников (если их ещё нет)
-    const newParticipants = participants.filter(
-      p => !chat.participants.some(existing => existing.toString() === p)
-    );
-
-    if (newParticipants.length === 0) {
-      return res.json({ success: true, message: 'Участники уже в группе', chat });
-    }
-
-    chat.participants.push(...newParticipants);
-    chat.updatedAt = new Date();
-    await chat.save();
-
-    // Создаём системное сообщение
-    await Message.create({
-      chatId,
-      sender: userId,
-      type: 'system',
-      content: `Добавлено участников: ${newParticipants.length}`
-    });
 
     const updatedChat = await Chat.findById(chat._id)
       .populate('participants', 'name avatar email isOnline lastSeen');
 
-    res.json({ success: true, chat: updatedChat });
-  } catch (error) {
-    logger.error(`Ошибка добавления участников: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * DELETE /api/chats/:id/participants/:participantId - Удалить участника из группы
- */
-router.delete('/:id/participants/:participantId', auth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const chatId = req.params.id;
-    const participantId = req.params.participantId;
-
-    const chat = await Chat.findOne({
-      _id: chatId,
-      type: 'group'
+    res.json({
+      success: true,
+      message: 'Чат обновлён',
+      chat: updatedChat
     });
 
-    if (!chat) {
-      return res.status(404).json({ success: false, error: 'Группа не найдена' });
-    }
-
-    // Нельзя удалить создателя
-    if (chat.creator.toString() === participantId) {
-      return res.status(400).json({ success: false, error: 'Нельзя удалить создателя группы' });
-    }
-
-    // Проверка прав
-    const isAdmin = chat.admins.some(admin => admin.toString() === userId);
-    const isSelf = participantId === userId;
-    
-    if (!isAdmin && !isSelf) {
-      return res.status(403).json({ success: false, error: 'Нет прав на удаление участника' });
-    }
-
-    chat.participants = chat.participants.filter(
-      p => p.toString() !== participantId
-    );
-    chat.admins = chat.admins.filter(a => a.toString() !== participantId);
-    chat.updatedAt = new Date();
-    await chat.save();
-
-    // Системное сообщение
-    await Message.create({
-      chatId,
-      sender: userId,
-      type: 'system',
-      content: isSelf ? 'Вы покинули группу' : 'Участник удалён из группы'
+  } catch (error) {
+    logger.error('Ошибка обновления чата:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при обновлении чата',
+      error: error.message
     });
-
-    res.json({ success: true, message: 'Участник удалён' });
-  } catch (error) {
-    logger.error(`Ошибка удаления участника: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * POST /api/chats/:id/pin - Закрепить чат
- */
-router.post('/:id/pin', auth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const chatId = req.params.id;
-
-    const chat = await Chat.findOne({
-      _id: chatId,
-      participants: userId
-    });
-
-    if (!chat) {
-      return res.status(404).json({ success: false, error: 'Чат не найден' });
-    }
-
-    // Добавляем пользователя в закреплённые
-    if (!chat.pinnedBy.includes(userId)) {
-      chat.pinnedBy.push(userId);
-      await chat.save();
-    }
-
-    res.json({ success: true, message: 'Чат закреплён' });
-  } catch (error) {
-    logger.error(`Ошибка закрепления чата: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * DELETE /api/chats/:id/pin - Открепить чат
- */
-router.delete('/:id/pin', auth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const chatId = req.params.id;
-
-    const chat = await Chat.findOne({
-      _id: chatId,
-      participants: userId
-    });
-
-    if (!chat) {
-      return res.status(404).json({ success: false, error: 'Чат не найден' });
-    }
-
-    chat.pinnedBy = chat.pinnedBy.filter(id => id.toString() !== userId);
-    await chat.save();
-
-    res.json({ success: true, message: 'Чат откреплён' });
-  } catch (error) {
-    logger.error(`Ошибка открепления чата: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * POST /api/chats/:id/archive - Архивировать чат
- */
-router.post('/:id/archive', auth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const chatId = req.params.id;
-
-    // Здесь можно добавить логику архивации (отдельное поле archivedBy)
-    // Для простоты просто возвращаем успех
-    res.json({ success: true, message: 'Чат архивирован' });
-  } catch (error) {
-    logger.error(`Ошибка архивации чата: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -435,35 +259,210 @@ router.post('/:id/archive', auth, async (req, res) => {
  */
 router.delete('/:id', auth, async (req, res) => {
   try {
-    const userId = req.user._id;
-    const chatId = req.params.id;
-
     const chat = await Chat.findOne({
-      _id: chatId,
-      participants: userId
+      _id: req.params.id,
+      participants: req.user._id
     });
 
     if (!chat) {
-      return res.status(404).json({ success: false, error: 'Чат не найден' });
+      return res.status(404).json({
+        success: false,
+        message: 'Чат не найден'
+      });
     }
 
-    // Если это личный чат или пользователь не создатель - просто удаляем из своих
-    // Если это группа и пользователь создатель - удаляем всю группу
-    if (chat.type === 'group' && chat.creator.toString() === userId) {
-      await Chat.deleteOne({ _id: chatId });
-      await Message.deleteMany({ chatId });
-      logger.info(`Группа ${chatId} удалена создателем`);
+    // Если создатель удаляет личный чат - удаляем полностью
+    if (chat.type === 'private' && chat.creator.toString() === req.user._id.toString()) {
+      await Chat.findByIdAndDelete(req.params.id);
+      await Message.deleteMany({ chatId: req.params.id });
+      
+      logger.info(`Чат удалён: ${req.params.id}`);
+      
+      return res.json({
+        success: true,
+        message: 'Чат удалён'
+      });
+    }
+
+    // Для группового чата или если не создатель - просто удаляем из участников
+    chat.participants = chat.participants.filter(id => id.toString() !== req.user._id.toString());
+    
+    if (chat.admins) {
+      chat.admins = chat.admins.filter(id => id.toString() !== req.user._id.toString());
+    }
+
+    // Если участников не осталось, удаляем чат
+    if (chat.participants.length === 0) {
+      await Chat.findByIdAndDelete(req.params.id);
+      await Message.deleteMany({ chatId: req.params.id });
     } else {
-      // Удаляем пользователя из участников
-      chat.participants = chat.participants.filter(p => p.toString() !== userId);
       await chat.save();
-      logger.info(`Пользователь ${userId} удалил чат ${chatId} у себя`);
     }
 
-    res.json({ success: true, message: 'Чат удалён' });
+    res.json({
+      success: true,
+      message: 'Вы покинули чат'
+    });
+
   } catch (error) {
-    logger.error(`Ошибка удаления чата: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
+    logger.error('Ошибка удаления чата:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при удалении чата',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/chats/:id/participants - Добавить участников в группу
+ */
+router.post('/:id/participants', auth, async (req, res) => {
+  try {
+    const chat = await Chat.findOne({
+      _id: req.params.id,
+      participants: req.user._id
+    });
+
+    if (!chat) {
+      return res.status(404).json({
+        success: false,
+        message: 'Чат не найден'
+      });
+    }
+
+    if (chat.type !== 'group') {
+      return res.status(400).json({
+        success: false,
+        message: 'Нельзя добавить участников в личный чат'
+      });
+    }
+
+    // Только админы могут добавлять участников
+    if (!chat.admins.some(id => id.toString() === req.user._id.toString())) {
+      return res.status(403).json({
+        success: false,
+        message: 'Только администраторы могут добавлять участников'
+      });
+    }
+
+    const { participants } = req.body;
+    if (!participants || !Array.isArray(participants) || participants.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Необходимо указать хотя бы одного участника'
+      });
+    }
+
+    // Проверка существования пользователей
+    const users = await User.find({ _id: { $in: participants }, _id: { $ne: req.user._id } });
+    if (users.length !== participants.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'Один или несколько пользователей не найдены'
+      });
+    }
+
+    // Добавляем новых участников (без дубликатов)
+    const newParticipants = participants.filter(id => 
+      !chat.participants.some(p => p.toString() === id)
+    );
+
+    if (newParticipants.length === 0) {
+      return res.json({
+        success: true,
+        message: 'Все указанные пользователи уже являются участниками',
+        chat
+      });
+    }
+
+    chat.participants.push(...newParticipants);
+    await chat.save();
+
+    const updatedChat = await Chat.findById(chat._id)
+      .populate('participants', 'name avatar email isOnline lastSeen');
+
+    res.json({
+      success: true,
+      message: `Добавлено ${newParticipants.length} участников`,
+      chat: updatedChat
+    });
+
+  } catch (error) {
+    logger.error('Ошибка добавления участников:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при добавлении участников',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * DELETE /api/chats/:id/participants/:userId - Удалить участника из группы
+ */
+router.delete('/:id/participants/:userId', auth, async (req, res) => {
+  try {
+    const chat = await Chat.findOne({
+      _id: req.params.id,
+      participants: req.user._id
+    });
+
+    if (!chat) {
+      return res.status(404).json({
+        success: false,
+        message: 'Чат не найден'
+      });
+    }
+
+    if (chat.type !== 'group') {
+      return res.status(400).json({
+        success: false,
+        message: 'Нельзя удалить участника из личного чата'
+      });
+    }
+
+    // Только админы могут удалять участников
+    if (!chat.admins.some(id => id.toString() === req.user._id.toString())) {
+      return res.status(403).json({
+        success: false,
+        message: 'Только администраторы могут удалять участников'
+      });
+    }
+
+    const userIdToRemove = req.params.userId;
+
+    // Нельзя удалить последнего участника или себя
+    if (chat.participants.length <= 1 || userIdToRemove === req.user._id.toString()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Невозможно удалить участника'
+      });
+    }
+
+    chat.participants = chat.participants.filter(id => id.toString() !== userIdToRemove);
+    if (chat.admins) {
+      chat.admins = chat.admins.filter(id => id.toString() !== userIdToRemove);
+    }
+
+    await chat.save();
+
+    const updatedChat = await Chat.findById(chat._id)
+      .populate('participants', 'name avatar email isOnline lastSeen');
+
+    res.json({
+      success: true,
+      message: 'Участник удалён из группы',
+      chat: updatedChat
+    });
+
+  } catch (error) {
+    logger.error('Ошибка удаления участника:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при удалении участника',
+      error: error.message
+    });
   }
 });
 

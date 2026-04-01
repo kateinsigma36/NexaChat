@@ -1,10 +1,11 @@
-const express = require('express');
+import express from 'express';
+import Message from '../models/Message.js';
+import Chat from '../models/Chat.js';
+import auth from '../middleware/auth.js';
+import { messageValidation } from '../utils/validators.js';
+import { logger } from '../utils/helpers.js';
+
 const router = express.Router();
-const Message = require('../models/Message');
-const Chat = require('../models/Chat');
-const auth = require('../middleware/auth');
-const { messageValidation } = require('../utils/validators');
-const { logger } = require('../utils/helpers');
 
 /**
  * GET /api/messages/:chatId - Получить сообщения чата с пагинацией
@@ -48,70 +49,101 @@ router.get('/:chatId', auth, async (req, res) => {
       success: true,
       count: messages.length,
       hasMore: messages.length === parseInt(limit),
-      messages: messages.reverse() // Возвращаем в хронологическом порядке
+      messages: messages.reverse() // Переворачиваем для хронологического порядка
     });
+
   } catch (error) {
-    logger.error(`Ошибка получения сообщений: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
+    logger.error('Ошибка получения сообщений:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при получении сообщений',
+      error: error.message
+    });
   }
 });
 
 /**
- * POST /api/messages - Отправить сообщение (REST API, альтернатива WebSocket)
+ * POST /api/messages - Отправить сообщение
  */
 router.post('/', auth, async (req, res) => {
   try {
-    const userId = req.user._id;
-    const { chatId, content, type = 'text', replyTo, attachments } = req.body;
-
-    // Валидация
     const { error } = messageValidation.validate(req.body);
     if (error) {
-      return res.status(400).json({ success: false, error: error.details[0].message });
+      return res.status(400).json({
+        success: false,
+        message: 'Ошибка валидации',
+        errors: error.details.map(d => d.message)
+      });
     }
+
+    const { chatId, content, type = 'text', replyTo, fileIds } = req.body;
+    const senderId = req.user._id;
 
     // Проверяем доступ к чату
     const chat = await Chat.findOne({
       _id: chatId,
-      participants: userId
+      participants: senderId
     });
 
     if (!chat) {
       return res.status(404).json({ success: false, error: 'Чат не найден' });
     }
 
+    // Если это ответ на сообщение, проверяем его существование
+    if (replyTo) {
+      const parentMessage = await Message.findOne({ _id: replyTo, chatId });
+      if (!parentMessage) {
+        return res.status(404).json({ success: false, error: 'Сообщение, на которое вы отвечаете, не найдено' });
+      }
+    }
+
     // Создаём сообщение
     const messageData = {
       chatId,
-      sender: userId,
+      sender: senderId,
       type,
-      content,
-      replyTo: replyTo || null,
-      attachments: attachments || []
+      content
     };
 
-    const message = await Message.create(messageData);
+    if (replyTo) messageData.replyTo = replyTo;
+    if (fileIds && fileIds.length > 0) messageData.files = fileIds;
 
-    // Заполняем данные
-    const populatedMessage = await Message.findById(message._id)
-      .populate('sender', 'name avatar email')
-      .populate('replyTo');
+    const message = new Message(messageData);
+    await message.save();
 
-    // Обновляем последнее сообщение в чате
+    // Обновляем lastMessage в чате
     await Chat.findByIdAndUpdate(chatId, {
       lastMessage: {
-        text: content,
-        sender: userId,
+        text: type === 'text' ? content : `[${type}]`,
+        sender: senderId,
         timestamp: new Date()
-      },
-      updatedAt: new Date()
+      }
     });
 
-    logger.info(`Сообщение отправлено в чат ${chatId} пользователем ${userId}`);
-    res.status(201).json({ success: true, message: populatedMessage });
+    // Заполняем данные об отправителе
+    const populatedMessage = await Message.findById(message._id)
+      .populate('sender', 'name avatar email')
+      .populate('replyTo')
+      .populate('files');
+
+    logger.info(`Сообщение создано: ${message._id} в чате ${chatId}`);
+
+    // TODO: Отправить через WebSocket
+    // io.to(chatId).emit('message:new', populatedMessage);
+
+    res.status(201).json({
+      success: true,
+      message: 'Сообщение отправлено',
+      data: populatedMessage
+    });
+
   } catch (error) {
-    logger.error(`Ошибка отправки сообщения: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
+    logger.error('Ошибка отправки сообщения:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при отправке сообщения',
+      error: error.message
+    });
   }
 });
 
@@ -120,25 +152,34 @@ router.post('/', auth, async (req, res) => {
  */
 router.put('/:id', auth, async (req, res) => {
   try {
-    const userId = req.user._id;
-    const messageId = req.params.id;
     const { content } = req.body;
 
+    if (!content || content.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Содержимое сообщения не может быть пустым'
+      });
+    }
+
     const message = await Message.findOne({
-      _id: messageId,
-      sender: userId
+      _id: req.params.id,
+      sender: req.user._id,
+      deletedForAll: false
     });
 
     if (!message) {
-      return res.status(404).json({ success: false, error: 'Сообщение не найдено' });
+      return res.status(404).json({
+        success: false,
+        message: 'Сообщение не найдено или вы не можете его редактировать'
+      });
     }
 
-    // Проверка времени (24 часа)
-    const hoursSinceSent = (Date.now() - message.createdAt.getTime()) / (1000 * 60 * 60);
-    if (hoursSinceSent > 24) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Можно редактировать только в течение 24 часов' 
+    // Можно редактировать только в течение 24 часов
+    const hoursSinceCreation = (Date.now() - message.createdAt.getTime()) / (1000 * 60 * 60);
+    if (hoursSinceCreation > 24) {
+      return res.status(403).json({
+        success: false,
+        message: 'Редактирование возможно только в течение 24 часов'
       });
     }
 
@@ -149,10 +190,24 @@ router.put('/:id', auth, async (req, res) => {
     const updatedMessage = await Message.findById(message._id)
       .populate('sender', 'name avatar email');
 
-    res.json({ success: true, message: updatedMessage });
+    logger.info(`Сообщение отредактировано: ${message._id}`);
+
+    // TODO: Отправить через WebSocket
+    // io.to(message.chatId).emit('message:updated', updatedMessage);
+
+    res.json({
+      success: true,
+      message: 'Сообщение обновлено',
+      data: updatedMessage
+    });
+
   } catch (error) {
-    logger.error(`Ошибка редактирования сообщения: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
+    logger.error('Ошибка редактирования сообщения:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при редактировании сообщения',
+      error: error.message
+    });
   }
 });
 
@@ -161,21 +216,27 @@ router.put('/:id', auth, async (req, res) => {
  */
 router.delete('/:id', auth, async (req, res) => {
   try {
+    const { forAll = false } = req.query;
     const userId = req.user._id;
-    const messageId = req.params.id;
-    const { deleteForAll = false } = req.query;
 
-    const message = await Message.findById(messageId);
+    const message = await Message.findOne({
+      _id: req.params.id,
+      chatId: { $in: (await Chat.find({ participants: userId }).distinct('_id')) }
+    });
+
     if (!message) {
-      return res.status(404).json({ success: false, error: 'Сообщение не найдено' });
+      return res.status(404).json({
+        success: false,
+        message: 'Сообщение не найдено'
+      });
     }
 
-    if (deleteForAll) {
-      // Только автор может удалить для всех
-      if (message.sender.toString() !== userId) {
-        return res.status(403).json({ 
-          success: false, 
-          error: 'Только автор может удалить сообщение для всех' 
+    if (forAll) {
+      // Удалить для всех (только автор может)
+      if (message.sender.toString() !== userId.toString()) {
+        return res.status(403).json({
+          success: false,
+          message: 'Только автор может удалить сообщение для всех'
         });
       }
 
@@ -183,21 +244,36 @@ router.delete('/:id', auth, async (req, res) => {
       message.content = '[Сообщение удалено]';
       await message.save();
 
-      logger.info(`Сообщение ${messageId} удалено для всех`);
+      logger.info(`Сообщение удалено для всех: ${message._id}`);
+
+      // TODO: Отправить через WebSocket
+      // io.to(message.chatId).emit('message:deleted', { messageId: message._id, forAll: true });
+
     } else {
-      // Удаление для себя
+      // Удалить только для себя
       if (!message.deletedFor.includes(userId)) {
         message.deletedFor.push(userId);
         await message.save();
       }
 
-      logger.info(`Сообщение ${messageId} удалено для пользователя ${userId}`);
+      logger.info(`Сообщение удалено для пользователя: ${message._id}, user: ${userId}`);
+
+      // TODO: Отправить через WebSocket
+      // io.to(message.chatId).emit('message:deleted', { messageId: message._id, userId });
     }
 
-    res.json({ success: true, message: 'Сообщение удалено' });
+    res.json({
+      success: true,
+      message: forAll ? 'Сообщение удалено для всех' : 'Сообщение удалено'
+    });
+
   } catch (error) {
-    logger.error(`Ошибка удаления сообщения: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
+    logger.error('Ошибка удаления сообщения:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при удалении сообщения',
+      error: error.message
+    });
   }
 });
 
@@ -206,216 +282,112 @@ router.delete('/:id', auth, async (req, res) => {
  */
 router.post('/:id/reactions', auth, async (req, res) => {
   try {
-    const userId = req.user._id;
-    const messageId = req.params.id;
     const { emoji } = req.body;
 
     if (!emoji) {
-      return res.status(400).json({ success: false, error: 'Эмодзи обязателен' });
+      return res.status(400).json({
+        success: false,
+        message: 'Эмодзи реакции обязателен'
+      });
     }
 
-    const message = await Message.findById(messageId);
+    const message = await Message.findOne({
+      _id: req.params.id,
+      chatId: { $in: (await Chat.find({ participants: req.user._id }).distinct('_id')) }
+    });
+
     if (!message) {
-      return res.status(404).json({ success: false, error: 'Сообщение не найдено' });
+      return res.status(404).json({
+        success: false,
+        message: 'Сообщение не найдено'
+      });
     }
 
-    // Проверяем доступ к чату
-    const chat = await Chat.findById(message.chatId);
-    const isParticipant = chat.participants.some(p => p.toString() === userId);
-    if (!isParticipant) {
-      return res.status(403).json({ success: false, error: 'Нет доступа к чату' });
-    }
-
-    // Добавляем или обновляем реакцию
-    const existingReaction = message.reactions.find(r => r.user.toString() === userId);
-    if (existingReaction) {
-      existingReaction.emoji = emoji;
-    } else {
-      message.reactions.push({ user: userId, emoji });
-    }
-
-    await message.save();
-
-    const updatedMessage = await Message.findById(messageId)
-      .populate('reactions.user', 'name avatar');
-
-    res.json({ success: true, reactions: updatedMessage.reactions });
-  } catch (error) {
-    logger.error(`Ошибка добавления реакции: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * DELETE /api/messages/:id/reactions - Удалить реакцию
- */
-router.delete('/:id/reactions', auth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const messageId = req.params.id;
-
-    const message = await Message.findById(messageId);
-    if (!message) {
-      return res.status(404).json({ success: false, error: 'Сообщение не найдено' });
-    }
-
-    message.reactions = message.reactions.filter(
-      r => r.user.toString() !== userId
+    // Проверяем, есть ли уже такая реакция от этого пользователя
+    const existingReactionIndex = message.reactions.findIndex(
+      r => r.user.toString() === req.user._id.toString() && r.emoji === emoji
     );
 
+    if (existingReactionIndex >= 0) {
+      // Удаляем реакцию (toggle)
+      message.reactions.splice(existingReactionIndex, 1);
+    } else {
+      // Удаляем другие реакции этого пользователя и добавляем новую
+      message.reactions = message.reactions.filter(r => r.user.toString() !== req.user._id.toString());
+      message.reactions.push({ user: req.user._id, emoji });
+    }
+
     await message.save();
 
-    res.json({ success: true, message: 'Реакция удалена' });
-  } catch (error) {
-    logger.error(`Ошибка удаления реакции: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+    const updatedMessage = await Message.findById(message._id)
+      .populate('reactions.user', 'name avatar');
 
-/**
- * POST /api/messages/:id/read - Отметить сообщение как прочитанное
- */
-router.post('/:id/read', auth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const messageId = req.params.id;
+    logger.info(`Реакция обновлена: ${message._id}, emoji: ${emoji}`);
 
-    const message = await Message.findById(messageId);
-    if (!message) {
-      return res.status(404).json({ success: false, error: 'Сообщение не найдено' });
-    }
-
-    // Проверяем доступ к чату
-    const chat = await Chat.findById(message.chatId);
-    const isParticipant = chat.participants.some(p => p.toString() === userId);
-    if (!isParticipant) {
-      return res.status(403).json({ success: false, error: 'Нет доступа к чату' });
-    }
-
-    // Добавляем запись о прочтении
-    const existingRead = message.readBy.find(r => r.user.toString() === userId);
-    if (!existingRead) {
-      message.readBy.push({ user: userId, readAt: new Date() });
-      await message.save();
-    }
-
-    res.json({ success: true, message: 'Статус прочтения обновлён' });
-  } catch (error) {
-    logger.error(`Ошибка обновления статуса прочтения: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * POST /api/messages/:id/forward - Переслать сообщение
- */
-router.post('/:id/forward', auth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const messageId = req.params.id;
-    const { targetChatId } = req.body;
-
-    if (!targetChatId) {
-      return res.status(400).json({ success: false, error: 'Целевой чат обязателен' });
-    }
-
-    const originalMessage = await Message.findById(messageId);
-    if (!originalMessage) {
-      return res.status(404).json({ success: false, error: 'Сообщение не найдено' });
-    }
-
-    // Проверяем доступ к целевому чату
-    const targetChat = await Chat.findOne({
-      _id: targetChatId,
-      participants: userId
-    });
-
-    if (!targetChat) {
-      return res.status(404).json({ success: false, error: 'Целевой чат не найден' });
-    }
-
-    // Создаём пересланное сообщение
-    const forwardedMessage = await Message.create({
-      chatId: targetChatId,
-      sender: userId,
-      type: originalMessage.type,
-      content: originalMessage.content,
-      attachments: originalMessage.attachments,
-      forwardedFrom: {
-        messageId: originalMessage._id,
-        chatId: originalMessage.chatId,
-        senderName: req.user.name
-      }
-    });
-
-    const populatedMessage = await Message.findById(forwardedMessage._id)
-      .populate('sender', 'name avatar email');
-
-    // Обновляем последнее сообщение в чате
-    await Chat.findByIdAndUpdate(targetChatId, {
-      lastMessage: {
-        text: originalMessage.content,
-        sender: userId,
-        timestamp: new Date()
-      },
-      updatedAt: new Date()
-    });
-
-    logger.info(`Сообщение переслано в чат ${targetChatId}`);
-    res.status(201).json({ success: true, message: populatedMessage });
-  } catch (error) {
-    logger.error(`Ошибка пересылки сообщения: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * GET /api/messages/search - Поиск по сообщениям
- */
-router.get('/search', auth, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const { q, chatId, page = 1, limit = 20 } = req.query;
-
-    if (!q) {
-      return res.status(400).json({ success: false, error: 'Поисковый запрос обязателен' });
-    }
-
-    // Находим чаты пользователя
-    const userChats = await Chat.find({ participants: userId }).select('_id');
-    const chatIds = userChats.map(c => c._id);
-
-    // Строим запрос
-    let query = {
-      chatId: { $in: chatIds },
-      type: 'text',
-      deletedForAll: false,
-      content: new RegExp(q, 'i')
-    };
-
-    if (chatId) {
-      query.chatId = chatId;
-    }
-
-    const messages = await Message.find(query)
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit))
-      .skip((page - 1) * limit)
-      .populate('chatId', 'type groupName participants')
-      .populate('sender', 'name avatar');
-
-    const total = await Message.countDocuments(query);
+    // TODO: Отправить через WebSocket
+    // io.to(message.chatId).emit('message:reaction', { messageId: message._id, reactions: updatedMessage.reactions });
 
     res.json({
       success: true,
-      count: messages.length,
-      total,
-      hasMore: page * limit < total,
-      messages
+      message: 'Реакция обновлена',
+      data: updatedMessage.reactions
     });
+
   } catch (error) {
-    logger.error(`Ошибка поиска сообщений: ${error.message}`);
-    res.status(500).json({ success: false, error: error.message });
+    logger.error('Ошибка добавления реакции:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при добавлении реакции',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * PUT /api/messages/:id/read - Отметить сообщение как прочитанное
+ */
+router.put('/:id/read', auth, async (req, res) => {
+  try {
+    const message = await Message.findOne({
+      _id: req.params.id,
+      chatId: { $in: (await Chat.find({ participants: req.user._id }).distinct('_id')) }
+    });
+
+    if (!message) {
+      return res.status(404).json({
+        success: false,
+        message: 'Сообщение не найдено'
+      });
+    }
+
+    // Проверяем, не прочитано ли уже
+    const alreadyRead = message.readBy.some(r => r.user.toString() === req.user._id.toString());
+    if (!alreadyRead) {
+      message.readBy.push({ user: req.user._id, readAt: new Date() });
+      await message.save();
+
+      logger.info(`Сообщение отмечено как прочитанное: ${message._id}`);
+
+      // TODO: Отправить через WebSocket
+      // io.to(message.chatId).emit('message:read', { 
+      //   messageId: message._id, 
+      //   userId: req.user._id,
+      //   readAt: new Date()
+      // });
+    }
+
+    res.json({
+      success: true,
+      message: 'Статус прочтения обновлён'
+    });
+
+  } catch (error) {
+    logger.error('Ошибка обновления статуса прочтения:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка сервера при обновлении статуса',
+      error: error.message
+    });
   }
 });
 

@@ -3,11 +3,12 @@
  * Обрабатывает подключения пользователей, сообщения, статусы онлайн, индикаторы набора
  */
 
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const Message = require('../models/Message');
-const Chat = require('../models/Chat');
-const { logger } = require('../utils/helpers');
+import jwt from 'jsonwebtoken';
+import User from '../models/User.js';
+import Message from '../models/Message.js';
+import Chat from '../models/Chat.js';
+import { logger } from '../utils/helpers.js';
+import { config } from '../config/env.js';
 
 // Хранилище активных подключений: userId -> socketId
 const onlineUsers = new Map();
@@ -17,702 +18,305 @@ const chatRooms = new Map();
 
 /**
  * Инициализация Socket.IO
- * @param {Server} io - Socket.IO сервер
  */
-const initializeSocket = (io) => {
+export function initializeSocket(io) {
   // Middleware для аутентификации при подключении
   io.use(async (socket, next) => {
     try {
-      const token = socket.handshake.auth.token;
+      const token = socket.handshake.auth.token || socket.handshake.query.token;
       
       if (!token) {
-        return next(new Error('Authentication error: Token not provided'));
+        return next(new Error('Токен не предоставлен'));
       }
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      const user = await User.findById(decoded.userId).select('-password');
-
-      if (!user) {
-        return next(new Error('Authentication error: User not found'));
-      }
-
-      // Сохраняем пользователя в объекте сокета
-      socket.user = user;
-      socket.userId = user._id.toString();
+      const decoded = jwt.verify(token, config.jwt.accessSecret);
+      socket.userId = decoded.userId;
+      socket.user = await User.findById(decoded.userId).select('-password');
       
-      logger.info(`🔌 Пользователь ${user.name} подключается к WebSocket`);
+      if (!socket.user) {
+        return next(new Error('Пользователь не найден'));
+      }
+
       next();
     } catch (error) {
-      logger.error(`❌ Ошибка аутентификации WebSocket: ${error.message}`);
-      next(new Error('Authentication error'));
+      logger.error('Ошибка аутентификации WebSocket:', error.message);
+      next(new Error('Неверный токен'));
     }
   });
 
-  // Обработка подключений
-  io.on('connection', (socket) => {
-    const { userId, user } = socket;
+  io.on('connection', async (socket) => {
+    logger.info(`🔌 Пользователь подключился: ${socket.user.name} (${socket.userId})`);
 
-    // === ПОДКЛЮЧЕНИЕ ПОЛЬЗОВАТЕЛЯ ===
-    handleUserConnection(socket, userId, user, io);
-
-    // === ОТКЛЮЧЕНИЕ ПОЛЬЗОВАТЕЛЯ ===
-    socket.on('disconnect', () => {
-      handleUserDisconnect(socket, userId, io);
-    });
-
-    // === СОБЫТИЯ ЧАТА ===
+    // Добавляем пользователя в онлайн
+    onlineUsers.set(socket.userId, socket.id);
     
-    // Присоединение к комнате чата
-    socket.on('join_chat', (chatId) => {
-      joinChatRoom(socket, chatId);
-    });
+    // Обновляем статус пользователя в БД
+    await User.findByIdAndUpdate(socket.userId, { isOnline: true });
 
-    // Выход из комнаты чата
-    socket.on('leave_chat', (chatId) => {
-      leaveChatRoom(socket, chatId);
-    });
+    // Сообщаем всем о новом онлайн пользователе
+    io.emit('user:online', { userId: socket.userId, timestamp: new Date() });
 
-    // Отправка сообщения
-    socket.on('send_message', async (data, callback) => {
-      await handleSendMessage(socket, data, callback, io);
-    });
+    // === Обработка присоединения к комнатам чатов ===
+    socket.on('chat:join', async ({ chatId }) => {
+      try {
+        const chat = await Chat.findOne({ _id: chatId, participants: socket.userId });
+        
+        if (!chat) {
+          socket.emit('error', { message: 'У вас нет доступа к этому чату' });
+          return;
+        }
 
-    // Статус прочтения сообщения
-    socket.on('message_read', (data) => {
-      handleMessageRead(socket, data, io);
-    });
+        socket.join(`chat:${chatId}`);
+        
+        if (!chatRooms.has(chatId)) {
+          chatRooms.set(chatId, new Set());
+        }
+        chatRooms.get(chatId).add(socket.id);
 
-    // Индикатор набора текста
-    socket.on('typing_start', (data) => {
-      handleTypingStart(socket, data, io);
-    });
-
-    socket.on('typing_stop', (data) => {
-      handleTypingStop(socket, data, io);
-    });
-
-    // Реакция на сообщение
-    socket.on('add_reaction', async (data, callback) => {
-      await handleAddReaction(socket, data, callback, io);
-    });
-
-    socket.on('remove_reaction', async (data, callback) => {
-      await handleRemoveReaction(socket, data, callback, io);
-    });
-
-    // Редактирование сообщения
-    socket.on('edit_message', async (data, callback) => {
-      await handleEditMessage(socket, data, callback, io);
-    });
-
-    // Удаление сообщения
-    socket.on('delete_message', async (data, callback) => {
-      await handleDeleteMessage(socket, data, callback, io);
-    });
-
-    // Пересылка сообщения
-    socket.on('forward_message', async (data, callback) => {
-      await handleForwardMessage(socket, data, callback, io);
-    });
-
-    // === СОБЫТИЯ ЗВОНКОВ (сигнализация WebRTC) ===
-    
-    socket.on('call_initiate', (data) => {
-      handleCallInitiate(socket, data, io);
-    });
-
-    socket.on('call_accept', (data) => {
-      handleCallAccept(socket, data, io);
-    });
-
-    socket.on('call_reject', (data) => {
-      handleCallReject(socket, data, io);
-    });
-
-    socket.on('call_end', (data) => {
-      handleCallEnd(socket, data, io);
-    });
-
-    // WebRTC ICE кандидаты и offer/answer
-    socket.on('webrtc_offer', (data) => {
-      handleWebRTCOffer(socket, data, io);
-    });
-
-    socket.on('webrtc_answer', (data) => {
-      handleWebRTCAnswer(socket, data, io);
-    });
-
-    socket.on('webrtc_ice_candidate', (data) => {
-      handleWebRTCIceCandidate(socket, data, io);
-    });
-  });
-
-  logger.info('✅ Socket.IO сервис инициализирован');
-};
-
-/**
- * Обработка подключения пользователя
- */
-const handleUserConnection = (socket, userId, user, io) => {
-  // Добавляем пользователя в онлайн
-  onlineUsers.set(userId, socket.id);
-  
-  // Обновляем статус пользователя в БД
-  User.findByIdAndUpdate(userId, { 
-    isOnline: true,
-    lastSeen: new Date()
-  }).catch(err => logger.error(`Ошибка обновления статуса онлайн: ${err.message}`));
-
-  // Присоединяемся к личной комнате пользователя (для личных уведомлений)
-  socket.join(`user:${userId}`);
-
-  // Уведомляем контакты о том, что пользователь онлайн
-  broadcastOnlineStatus(userId, true, io);
-
-  logger.info(`🟢 Пользователь ${user.name} теперь онлайн`);
-};
-
-/**
- * Обработка отключения пользователя
- */
-const handleUserDisconnect = (socket, userId, io) => {
-  // Удаляем из онлайн
-  onlineUsers.delete(userId);
-  
-  // Проверяем, есть ли другие активные подключения у этого пользователя
-  const userStillOnline = Array.from(onlineUsers.values()).some(
-    socketId => io.sockets.sockets.get(socketId)?.userId === userId
-  );
-
-  if (!userStillOnline) {
-    // Обновляем статус в БД
-    User.findByIdAndUpdate(userId, { 
-      isOnline: false,
-      lastSeen: new Date()
-    }).catch(err => logger.error(`Ошибка обновления статуса офлайн: ${err.message}`));
-
-    // Уведомляем контакты о том, что пользователь офлайн
-    broadcastOnlineStatus(userId, false, io);
-
-    logger.info(`🔴 Пользователь отключился`);
-  }
-
-  // Выход из всех комнат чатов
-  chatRooms.forEach((members, chatId) => {
-    if (members.has(socket.id)) {
-      members.delete(socket.id);
-      if (members.size === 0) {
-        chatRooms.delete(chatId);
+        logger.debug(`Пользователь ${socket.userId} присоединился к чату ${chatId}`);
+      } catch (error) {
+        logger.error('Ошибка присоединения к чату:', error);
       }
-    }
-  });
-};
-
-/**
- * Присоединение к комнате чата
- */
-const joinChatRoom = (socket, chatId) => {
-  socket.join(`chat:${chatId}`);
-  
-  if (!chatRooms.has(chatId)) {
-    chatRooms.set(chatId, new Set());
-  }
-  chatRooms.get(chatId).add(socket.id);
-  
-  logger.info(`Пользователь ${socket.user.name} присоединился к чату ${chatId}`);
-};
-
-/**
- * Выход из комнаты чата
- */
-const leaveChatRoom = (socket, chatId) => {
-  socket.leave(`chat:${chatId}`);
-  
-  if (chatRooms.has(chatId)) {
-    const members = chatRooms.get(chatId);
-    members.delete(socket.id);
-    if (members.size === 0) {
-      chatRooms.delete(chatId);
-    }
-  }
-  
-  logger.info(`Пользователь ${socket.user.name} покинул чат ${chatId}`);
-};
-
-/**
- * Отправка сообщения
- */
-const handleSendMessage = async (socket, data, callback, io) => {
-  try {
-    const { chatId, content, type = 'text', replyTo, attachments } = data;
-    const senderId = socket.userId;
-
-    // Валидация
-    if (!chatId || !content) {
-      return callback?.({ success: false, error: 'Некорректные данные сообщения' });
-    }
-
-    // Проверка доступа к чату
-    const chat = await Chat.findById(chatId);
-    if (!chat) {
-      return callback?.({ success: false, error: 'Чат не найден' });
-    }
-
-    const isParticipant = chat.participants.some(
-      p => p.toString() === senderId
-    );
-    if (!isParticipant) {
-      return callback?.({ success: false, error: 'Нет доступа к чату' });
-    }
-
-    // Создаём сообщение
-    const messageData = {
-      chatId,
-      sender: senderId,
-      type,
-      content,
-      replyTo: replyTo || null,
-      attachments: attachments || []
-    };
-
-    const message = await Message.create(messageData);
-
-    // Заполняем данные отправителя
-    const populatedMessage = await Message.findById(message._id)
-      .populate('sender', 'name avatar email')
-      .populate('replyTo');
-
-    // Обновляем последнее сообщение в чате
-    await Chat.findByIdAndUpdate(chatId, {
-      lastMessage: {
-        text: content,
-        sender: senderId,
-        timestamp: new Date()
-      },
-      updatedAt: new Date()
     });
 
-    // Отправляем сообщение всем участникам чата
-    io.to(`chat:${chatId}`).emit('new_message', populatedMessage);
+    socket.on('chat:leave', ({ chatId }) => {
+      socket.leave(`chat:${chatId}`);
+      
+      if (chatRooms.has(chatId)) {
+        chatRooms.get(chatId).delete(socket.id);
+      }
+      
+      logger.debug(`Пользователь ${socket.userId} покинул чат ${chatId}`);
+    });
 
-    // Уведомляем получателей (если они не в сети в этом чате)
-    chat.participants.forEach(participantId => {
-      if (participantId.toString() !== senderId) {
-        io.to(`user:${participantId}`).emit('notification', {
-          type: 'new_message',
+    // === Обработка сообщений ===
+    socket.on('message:new', async (data) => {
+      try {
+        const { chatId, content, type = 'text', replyTo } = data;
+
+        const chat = await Chat.findOne({ _id: chatId, participants: socket.userId });
+        if (!chat) {
+          socket.emit('error', { message: 'У вас нет доступа к этому чату' });
+          return;
+        }
+
+        const message = new Message({
           chatId,
-          message: populatedMessage,
-          from: socket.user.name
+          sender: socket.userId,
+          type,
+          content
+        });
+
+        if (replyTo) message.replyTo = replyTo;
+        
+        await message.save();
+
+        // Обновляем lastMessage в чате
+        await Chat.findByIdAndUpdate(chatId, {
+          lastMessage: {
+            text: type === 'text' ? content : `[${type}]`,
+            sender: socket.userId,
+            timestamp: new Date()
+          }
+        });
+
+        const populatedMessage = await Message.findById(message._id)
+          .populate('sender', 'name avatar email');
+
+        // Отправляем сообщение всем участникам чата
+        io.to(`chat:${chatId}`).emit('message:new', populatedMessage);
+
+        logger.info(`Сообщение отправлено в чат ${chatId}`);
+      } catch (error) {
+        logger.error('Ошибка отправки сообщения:', error);
+        socket.emit('error', { message: 'Ошибка отправки сообщения' });
+      }
+    });
+
+    // === Индикатор набора текста ===
+    socket.on('typing:start', ({ chatId }) => {
+      socket.to(`chat:${chatId}`).emit('typing:start', {
+        userId: socket.userId,
+        userName: socket.user.name,
+        chatId
+      });
+    });
+
+    socket.on('typing:stop', ({ chatId }) => {
+      socket.to(`chat:${chatId}`).emit('typing:stop', {
+        userId: socket.userId,
+        chatId
+      });
+    });
+
+    // === Статусы прочтения ===
+    socket.on('message:read', async ({ chatId, messageId }) => {
+      try {
+        await Message.findByIdAndUpdate(messageId, {
+          $addToSet: {
+            readBy: { user: socket.userId, readAt: new Date() }
+          }
+        });
+
+        socket.to(`chat:${chatId}`).emit('message:read', {
+          messageId,
+          userId: socket.userId,
+          chatId
+        });
+      } catch (error) {
+        logger.error('Ошибка обновления статуса прочтения:', error);
+      }
+    });
+
+    // === Реакции на сообщения ===
+    socket.on('message:reaction', async ({ messageId, emoji }) => {
+      try {
+        const message = await Message.findById(messageId);
+        if (!message) return;
+
+        const chat = await Chat.findOne({ _id: message.chatId, participants: socket.userId });
+        if (!chat) return;
+
+        const existingIndex = message.reactions.findIndex(
+          r => r.user.toString() === socket.userId.toString() && r.emoji === emoji
+        );
+
+        if (existingIndex >= 0) {
+          message.reactions.splice(existingIndex, 1);
+        } else {
+          message.reactions = message.reactions.filter(r => r.user.toString() !== socket.userId.toString());
+          message.reactions.push({ user: socket.userId, emoji });
+        }
+
+        await message.save();
+
+        const updatedMessage = await Message.findById(messageId)
+          .populate('reactions.user', 'name avatar');
+
+        io.to(`chat:${message.chatId}`).emit('message:reaction', {
+          messageId,
+          reactions: updatedMessage.reactions
+        });
+      } catch (error) {
+        logger.error('Ошибка добавления реакции:', error);
+      }
+    });
+
+    // === WebRTC сигнализация для звонков ===
+    socket.on('call:initiate', ({ targetUserId, type, chatId }) => {
+      const targetSocketId = onlineUsers.get(targetUserId);
+      
+      if (!targetSocketId) {
+        socket.emit('call:error', { message: 'Пользователь не в сети' });
+        return;
+      }
+
+      io.to(targetSocketId).emit('call:incoming', {
+        fromUserId: socket.userId,
+        fromUserName: socket.user.name,
+        fromUserAvatar: socket.user.avatar,
+        type,
+        chatId,
+        timestamp: new Date()
+      });
+
+      logger.info(`Звонок инициирован: ${socket.userId} -> ${targetUserId}`);
+    });
+
+    socket.on('call:accept', ({ targetUserId, callId }) => {
+      const targetSocketId = onlineUsers.get(targetUserId);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('call:accepted', { callId, acceptedBy: socket.userId });
+      }
+    });
+
+    socket.on('call:reject', ({ targetUserId, callId }) => {
+      const targetSocketId = onlineUsers.get(targetUserId);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('call:rejected', { callId, rejectedBy: socket.userId });
+      }
+    });
+
+    socket.on('call:end', ({ targetUserId, callId }) => {
+      const targetSocketId = onlineUsers.get(targetUserId);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('call:ended', { callId, endedBy: socket.userId });
+      }
+    });
+
+    socket.on('webrtc_offer', ({ targetUserId, offer }) => {
+      const targetSocketId = onlineUsers.get(targetUserId);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('webrtc_offer', {
+          fromUserId: socket.userId,
+          offer
         });
       }
     });
 
-    logger.info(`📨 Сообщение отправлено в чат ${chatId}`);
-    callback?.({ success: true, message: populatedMessage });
-  } catch (error) {
-    logger.error(`Ошибка отправки сообщения: ${error.message}`);
-    callback?.({ success: false, error: error.message });
-  }
-};
+    socket.on('webrtc_answer', ({ targetUserId, answer }) => {
+      const targetSocketId = onlineUsers.get(targetUserId);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('webrtc_answer', {
+          fromUserId: socket.userId,
+          answer
+        });
+      }
+    });
 
-/**
- * Обработка прочтения сообщения
- */
-const handleMessageRead = async (socket, data, io) => {
-  try {
-    const { chatId, messageId } = data;
-    const userId = socket.userId;
+    socket.on('webrtc_ice_candidate', ({ targetUserId, candidate }) => {
+      const targetSocketId = onlineUsers.get(targetUserId);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('webrtc_ice_candidate', {
+          fromUserId: socket.userId,
+          candidate
+        });
+      }
+    });
 
-    // Обновляем статус прочтения
-    await Message.updateOne(
-      { _id: messageId },
-      {
-        $addToSet: {
-          readBy: { user: userId, readAt: new Date() }
+    // === Обработка отключения ===
+    socket.on('disconnect', async () => {
+      logger.info(`🔌 Пользователь отключился: ${socket.user?.name || socket.userId}`);
+
+      onlineUsers.delete(socket.userId);
+
+      // Проверяем, есть ли другие подключения этого пользователя
+      const stillOnline = Array.from(onlineUsers.values()).some(id => 
+        id !== socket.id && onlineUsers.get(socket.userId) === id
+      );
+
+      if (!stillOnline) {
+        await User.findByIdAndUpdate(socket.userId, { isOnline: false });
+        io.emit('user:offline', { userId: socket.userId, timestamp: new Date() });
+      }
+
+      // Удаляем из комнат чатов
+      chatRooms.forEach((sockets, chatId) => {
+        if (sockets.has(socket.id)) {
+          sockets.delete(socket.id);
+          if (sockets.size === 0) {
+            chatRooms.delete(chatId);
+          }
         }
-      }
-    );
-
-    // Уведомляем отправителя о прочтении
-    const message = await Message.findById(messageId);
-    if (message && message.sender.toString() !== userId) {
-      io.to(`user:${message.sender}`).emit('message_read_update', {
-        messageId,
-        chatId,
-        readBy: userId,
-        readAt: new Date()
-      });
-    }
-
-    // Отправляем обновление всем в чате
-    io.to(`chat:${chatId}`).emit('messages_read', {
-      chatId,
-      messageId,
-      readBy: userId
-    });
-  } catch (error) {
-    logger.error(`Ошибка обновления статуса прочтения: ${error.message}`);
-  }
-};
-
-/**
- * Начало набора текста
- */
-const handleTypingStart = (socket, data, io) => {
-  const { chatId } = data;
-  const userId = socket.userId;
-  const userName = socket.user.name;
-
-  io.to(`chat:${chatId}`).emit('user_typing', {
-    chatId,
-    userId,
-    userName,
-    isTyping: true
-  });
-};
-
-/**
- * Остановка набора текста
- */
-const handleTypingStop = (socket, data, io) => {
-  const { chatId } = data;
-  const userId = socket.userId;
-
-  io.to(`chat:${chatId}`).emit('user_typing', {
-    chatId,
-    userId,
-    isTyping: false
-  });
-};
-
-/**
- * Добавление реакции
- */
-const handleAddReaction = async (socket, data, callback, io) => {
-  try {
-    const { messageId, emoji } = data;
-    const userId = socket.userId;
-
-    const message = await Message.findById(messageId);
-    if (!message) {
-      return callback?.({ success: false, error: 'Сообщение не найдено' });
-    }
-
-    // Проверяем доступ к чату
-    const chat = await Chat.findById(message.chatId);
-    const isParticipant = chat.participants.some(p => p.toString() === userId);
-    if (!isParticipant) {
-      return callback?.({ success: false, error: 'Нет доступа' });
-    }
-
-    // Добавляем или обновляем реакцию
-    const existingReaction = message.reactions.find(r => r.user.toString() === userId);
-    if (existingReaction) {
-      existingReaction.emoji = emoji;
-    } else {
-      message.reactions.push({ user: userId, emoji });
-    }
-
-    await message.save();
-
-    const updatedMessage = await Message.findById(messageId)
-      .populate('reactions.user', 'name avatar');
-
-    io.to(`chat:${message.chatId}`).emit('reaction_updated', {
-      messageId,
-      reactions: updatedMessage.reactions
-    });
-
-    callback?.({ success: true, reactions: updatedMessage.reactions });
-  } catch (error) {
-    logger.error(`Ошибка добавления реакции: ${error.message}`);
-    callback?.({ success: false, error: error.message });
-  }
-};
-
-/**
- * Удаление реакции
- */
-const handleRemoveReaction = async (socket, data, callback, io) => {
-  try {
-    const { messageId } = data;
-    const userId = socket.userId;
-
-    const message = await Message.findById(messageId);
-    if (!message) {
-      return callback?.({ success: false, error: 'Сообщение не найдено' });
-    }
-
-    message.reactions = message.reactions.filter(
-      r => r.user.toString() !== userId
-    );
-
-    await message.save();
-
-    io.to(`chat:${message.chatId}`).emit('reaction_updated', {
-      messageId,
-      reactions: message.reactions
-    });
-
-    callback?.({ success: true });
-  } catch (error) {
-    logger.error(`Ошибка удаления реакции: ${error.message}`);
-    callback?.({ success: false, error: error.message });
-  }
-};
-
-/**
- * Редактирование сообщения
- */
-const handleEditMessage = async (socket, data, callback, io) => {
-  try {
-    const { messageId, content } = data;
-    const userId = socket.userId;
-
-    const message = await Message.findById(messageId);
-    if (!message) {
-      return callback?.({ success: false, error: 'Сообщение не найдено' });
-    }
-
-    // Проверка: только автор может редактировать
-    if (message.sender.toString() !== userId) {
-      return callback?.({ success: false, error: 'Только автор может редактировать' });
-    }
-
-    // Проверка времени (24 часа)
-    const hoursSinceSent = (Date.now() - message.createdAt.getTime()) / (1000 * 60 * 60);
-    if (hoursSinceSent > 24) {
-      return callback?.({ success: false, error: 'Прошло более 24 часов' });
-    }
-
-    message.content = content;
-    message.editedAt = new Date();
-    await message.save();
-
-    const updatedMessage = await Message.findById(messageId)
-      .populate('sender', 'name avatar');
-
-    io.to(`chat:${message.chatId}`).emit('message_edited', {
-      messageId,
-      content,
-      editedAt: message.editedAt,
-      sender: updatedMessage.sender
-    });
-
-    callback?.({ success: true, message: updatedMessage });
-  } catch (error) {
-    logger.error(`Ошибка редактирования сообщения: ${error.message}`);
-    callback?.({ success: false, error: error.message });
-  }
-};
-
-/**
- * Удаление сообщения
- */
-const handleDeleteMessage = async (socket, data, callback, io) => {
-  try {
-    const { messageId, deleteForAll = false } = data;
-    const userId = socket.userId;
-
-    const message = await Message.findById(messageId);
-    if (!message) {
-      return callback?.({ success: false, error: 'Сообщение не найдено' });
-    }
-
-    if (deleteForAll) {
-      // Проверка: только автор может удалить для всех
-      if (message.sender.toString() !== userId) {
-        return callback?.({ success: false, error: 'Только автор может удалить для всех' });
-      }
-      
-      message.deletedForAll = true;
-      message.content = '[Сообщение удалено]';
-      await message.save();
-
-      io.to(`chat:${message.chatId}`).emit('message_deleted', {
-        messageId,
-        deletedForAll: true
-      });
-    } else {
-      // Удаление для себя
-      message.deletedFor.push(userId);
-      await message.save();
-
-      io.to(`user:${userId}`).emit('message_deleted_for_me', {
-        messageId
-      });
-    }
-
-    callback?.({ success: true });
-  } catch (error) {
-    logger.error(`Ошибка удаления сообщения: ${error.message}`);
-    callback?.({ success: false, error: error.message });
-  }
-};
-
-/**
- * Пересылка сообщения
- */
-const handleForwardMessage = async (socket, data, callback, io) => {
-  try {
-    const { messageId, targetChatId } = data;
-    const userId = socket.userId;
-
-    const originalMessage = await Message.findById(messageId);
-    if (!originalMessage) {
-      return callback?.({ success: false, error: 'Сообщение не найдено' });
-    }
-
-    // Проверка доступа к целевому чату
-    const targetChat = await Chat.findById(targetChatId);
-    if (!targetChat) {
-      return callback?.({ success: false, error: 'Чат не найден' });
-    }
-
-    const isParticipant = targetChat.participants.some(p => p.toString() === userId);
-    if (!isParticipant) {
-      return callback?.({ success: false, error: 'Нет доступа к чату' });
-    }
-
-    // Создаём пересланное сообщение
-    const forwardedMessage = await Message.create({
-      chatId: targetChatId,
-      sender: userId,
-      type: originalMessage.type,
-      content: originalMessage.content,
-      attachments: originalMessage.attachments,
-      forwardedFrom: {
-        messageId: originalMessage._id,
-        chatId: originalMessage.chatId,
-        senderName: socket.user.name
-      }
-    });
-
-    const populatedMessage = await Message.findById(forwardedMessage._id)
-      .populate('sender', 'name avatar');
-
-    // Обновляем последнее сообщение
-    await Chat.findByIdAndUpdate(targetChatId, {
-      lastMessage: {
-        text: originalMessage.content,
-        sender: userId,
-        timestamp: new Date()
-      },
-      updatedAt: new Date()
-    });
-
-    io.to(`chat:${targetChatId}`).emit('new_message', populatedMessage);
-
-    callback?.({ success: true, message: populatedMessage });
-  } catch (error) {
-    logger.error(`Ошибка пересылки сообщения: ${error.message}`);
-    callback?.({ success: false, error: error.message });
-  }
-};
-
-/**
- * Уведомление об изменении статуса онлайн
- */
-const broadcastOnlineStatus = (userId, isOnline, io) => {
-  // Находим все чаты с этим пользователем
-  Chat.find({ participants: userId }).then(chats => {
-    chats.forEach(chat => {
-      io.to(`chat:${chat._id}`).emit('user_status_changed', {
-        userId,
-        isOnline,
-        chatId: chat._id
       });
     });
-  }).catch(err => logger.error(`Ошибка рассылки статуса: ${err.message}`));
-};
 
-// === СИГНАЛИЗАЦИЯ WEBRTC ДЛЯ ЗВОНКОВ ===
-
-const handleCallInitiate = (socket, data, io) => {
-  const { calleeId, callType, chatId } = data;
-  
-  io.to(`user:${calleeId}`).emit('incoming_call', {
-    callerId: socket.userId,
-    callerName: socket.user.name,
-    callerAvatar: socket.user.avatar,
-    callType,
-    chatId,
-    timestamp: new Date()
+    // === Обработка ошибок ===
+    socket.on('error', (error) => {
+      logger.error('WebSocket ошибка:', error);
+    });
   });
 
-  logger.info(`📞 Входящий звонок от ${socket.user.name} к пользователю ${calleeId}`);
-};
+  logger.info('✅ Socket.IO инициализирован');
+}
 
-const handleCallAccept = (socket, data, io) => {
-  const { callerId, chatId } = data;
-  
-  io.to(`user:${callerId}`).emit('call_accepted', {
-    calleeId: socket.userId,
-    chatId
-  });
-};
-
-const handleCallReject = (socket, data, io) => {
-  const { callerId } = data;
-  
-  io.to(`user:${callerId}`).emit('call_rejected', {
-    calleeId: socket.userId
-  });
-};
-
-const handleCallEnd = (socket, data, io) => {
-  const { otherUserId } = data;
-  
-  io.to(`user:${otherUserId}`).emit('call_ended', {
-    endedBy: socket.userId
-  });
-};
-
-const handleWebRTCOffer = (socket, data, io) => {
-  const { targetUserId, offer } = data;
-  
-  io.to(`user:${targetUserId}`).emit('webrtc_offer', {
-    fromUserId: socket.userId,
-    offer
-  });
-};
-
-const handleWebRTCAnswer = (socket, data, io) => {
-  const { targetUserId, answer } = data;
-  
-  io.to(`user:${targetUserId}`).emit('webrtc_answer', {
-    fromUserId: socket.userId,
-    answer
-  });
-};
-
-const handleWebRTCIceCandidate = (socket, data, io) => {
-  const { targetUserId, candidate } = data;
-  
-  io.to(`user:${targetUserId}`).emit('webrtc_ice_candidate', {
-    fromUserId: socket.userId,
-    candidate
-  });
-};
-
-/**
- * Получение списка онлайн пользователей
- */
-const getOnlineUsers = () => {
+// Утилиты
+export function getOnlineUsers() {
   return Array.from(onlineUsers.keys());
-};
+}
 
-/**
- * Проверка, онлайн ли пользователь
- */
-const isUserOnline = (userId) => {
+export function isUserOnline(userId) {
   return onlineUsers.has(userId);
-};
+}
 
-export {
-  initializeSocket,
-  getOnlineUsers,
-  isUserOnline,
-  onlineUsers,
-  chatRooms
-};
+export { onlineUsers, chatRooms };

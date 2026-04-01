@@ -20,7 +20,7 @@ const envSchema = Joi.object({
   // Redis
   REDIS_HOST: Joi.string().default('localhost'),
   REDIS_PORT: Joi.number().default(6379),
-  REDIS_PASSWORD: Joi.string().allow('').default(''),
+  REDIS_PASSWORD: Joi.string().allow('', null).default(''),
   
   // JWT
   JWT_ACCESS_SECRET: Joi.string().required(),
@@ -31,8 +31,8 @@ const envSchema = Joi.object({
   // Email
   SMTP_HOST: Joi.string().default('smtp.gmail.com'),
   SMTP_PORT: Joi.number().default(587),
-  SMTP_USER: Joi.string().email().allow('').default(''),
-  SMTP_PASS: Joi.string().allow('').default(''),
+  SMTP_USER: Joi.string().email().allow('', null).default(''),
+  SMTP_PASS: Joi.string().allow('', null).default(''),
   EMAIL_FROM: Joi.string().default('NexaChat <noreply@nexachat.com>'),
   
   // Frontend
@@ -43,13 +43,13 @@ const envSchema = Joi.object({
   UPLOAD_PATH: Joi.string().default('./uploads'),
   
   // TURN сервер
-  TURN_HOST: Joi.string().allow('').default(''),
-  TURN_USERNAME: Joi.string().allow('').default('nexachat'),
-  TURN_PASSWORD: Joi.string().allow('').default(''),
+  TURN_HOST: Joi.string().allow('', null).default(''),
+  TURN_USERNAME: Joi.string().allow('', null).default('nexachat'),
+  TURN_PASSWORD: Joi.string().allow('', null).default(''),
   
   // Firebase
-  FCM_SERVER_KEY: Joi.string().allow('').default('')
-});
+  FCM_SERVER_KEY: Joi.string().allow('', null).default('')
+}).unknown(true); // Разрешаем неизвестные переменные окружения (например, SHELL, PATH и т.д.)
 
 // Валидация переменных
 const { value: env, error } = envSchema.prefs({ errors: { label: 'key' } }).validate(process.env);

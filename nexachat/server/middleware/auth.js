@@ -19,7 +19,7 @@ export const protect = asyncHandler(async (req, res, next) => {
     token = req.headers.authorization.split(' ')[1];
   }
   
-  // Если токена нет
+  // Если токента нет
   if (!token) {
     return res.status(401).json({
       success: false,
@@ -48,22 +48,22 @@ export const protect = asyncHandler(async (req, res, next) => {
       });
     }
     
-    // Добавляем пользователя в request
+    // Добавляем пользователя в запрос
     req.user = user;
     next();
     
   } catch (error) {
-    console.error('Ошибка аутентификации:', error);
     return res.status(401).json({
       success: false,
-      message: 'Ошибка аутентификации'
+      message: 'Ошибка аутентификации',
+      error: error.message
     });
   }
 });
 
 /**
- * Middleware для опциональной аутентификации
- * Если токен есть - проверяем его, если нет - продолжаем без пользователя
+ * Опциональная аутентификация
+ * Если токен есть - проверяем и добавляем пользователя, если нет - продолжаем
  */
 export const optionalAuth = asyncHandler(async (req, res, next) => {
   let token;
@@ -72,39 +72,40 @@ export const optionalAuth = asyncHandler(async (req, res, next) => {
     token = req.headers.authorization.split(' ')[1];
   }
   
-  if (token) {
-    try {
-      const decoded = verifyAccessToken(token);
-      
-      if (decoded) {
-        const user = await User.findById(decoded.userId).select('-password -refreshToken');
-        if (user) {
-          req.user = user;
-        }
+  if (!token) {
+    return next();
+  }
+  
+  try {
+    const decoded = verifyAccessToken(token);
+    if (decoded) {
+      const user = await User.findById(decoded.userId).select('-password -refreshToken');
+      if (user) {
+        req.user = user;
       }
-    } catch (error) {
-      // Игнорируем ошибки, так как аутентификация опциональна
     }
+  } catch (error) {
+    // Игнорируем ошибки для опциональной аутентификации
   }
   
   next();
 });
 
 /**
- * Middleware для проверки роли администратора
- * Должен использоваться после protect
+ * Проверка на администратора
  */
 export const requireAdmin = asyncHandler(async (req, res, next) => {
-  // Здесь можно добавить проверку на администратора
-  // Например, проверка email или специального поля в модели User
-  
-  // Пока что просто пропускаем (заглушка для будущего функционала)
+  if (!req.user || !req.user.isAdmin) {
+    return res.status(403).json({
+      success: false,
+      message: 'Требуется права администратора'
+    });
+  }
   next();
 });
 
 /**
- * Middleware для проверки, что пользователь является участником чата
- * @param {string} chatIdParam - Название параметра с ID чата (req.params или req.body)
+ * Middleware для проверки участия в чате
  */
 export const isChatParticipant = (chatIdParam = 'chatId') => {
   return asyncHandler(async (req, res, next) => {
@@ -117,34 +118,26 @@ export const isChatParticipant = (chatIdParam = 'chatId') => {
       });
     }
     
-    // Импортируем Chat динамически для избежания циклических зависимостей
     const Chat = (await import('../models/Chat.js')).default;
     
-    const chat = await Chat.findById(chatId);
+    const chat = await Chat.findOne({
+      _id: chatId,
+      participants: req.user._id
+    });
     
     if (!chat) {
-      return res.status(404).json({
-        success: false,
-        message: 'Чат не найден'
-      });
-    }
-    
-    // Проверяем, является ли пользователь участником
-    if (!chat.isParticipant(req.user._id)) {
       return res.status(403).json({
         success: false,
         message: 'У вас нет доступа к этому чату'
       });
     }
     
-    // Добавляем чат в request для дальнейшего использования
-    req.chat = chat;
     next();
   });
 };
 
 /**
- * Middleware для проверки, что пользователь не заблокирован
+ * Проверка блокировки между пользователями
  */
 export const isNotBlocked = asyncHandler(async (req, res, next) => {
   const userId = req.params.userId || req.body.userId;
@@ -153,15 +146,13 @@ export const isNotBlocked = asyncHandler(async (req, res, next) => {
     return next();
   }
   
+  const User = (await import('../models/User.js')).default;
   const user = await User.findById(userId);
   
   if (!user) {
-    return res.status(404).json({
-      success: false,
-      message: 'Пользователь не найден'
-    });
+    return next();
   }
-  
+
   // Проверяем, не заблокировал ли текущий пользователь этого пользователя
   if (user.blockedUsers.includes(req.user._id)) {
     return res.status(403).json({
@@ -169,7 +160,7 @@ export const isNotBlocked = asyncHandler(async (req, res, next) => {
       message: 'Вы заблокировали этого пользователя'
     });
   }
-  
+
   // Проверяем, не заблокировал ли этот пользователь текущего
   if (req.user.blockedUsers.includes(user._id)) {
     return res.status(403).json({
@@ -177,6 +168,9 @@ export const isNotBlocked = asyncHandler(async (req, res, next) => {
       message: 'Этот пользователь заблокировал вас'
     });
   }
-  
+
   next();
 });
+
+// Экспорт по умолчанию для совместимости
+export default protect;
